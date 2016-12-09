@@ -56,18 +56,18 @@
 
 /*----------------------------------------------------------------------------*/
 /* handlers for threads */
-struct mtcp_thread_context *g_pctx[MAX_CPUS];
-struct log_thread_context *g_logctx[MAX_CPUS];
+struct mtcp_thread_context *g_pctx[MAX_CPUS] = {0};
+struct log_thread_context *g_logctx[MAX_CPUS] = {0};
 /*----------------------------------------------------------------------------*/
-static pthread_t g_thread[MAX_CPUS];
-static pthread_t log_thread[MAX_CPUS];;
+static pthread_t g_thread[MAX_CPUS] = {0};
+static pthread_t log_thread[MAX_CPUS]  = {0};
 /*----------------------------------------------------------------------------*/
 static sem_t g_init_sem[MAX_CPUS];
-static int running[MAX_CPUS];
+static int running[MAX_CPUS] = {0};
 /*----------------------------------------------------------------------------*/
 mtcp_sighandler_t app_signal_handler;
-static int sigint_cnt[MAX_CPUS];
-static struct timeval sigint_ts[MAX_CPUS];
+static int sigint_cnt[MAX_CPUS] = {0};
+static struct timespec sigint_ts[MAX_CPUS];
 /*----------------------------------------------------------------------------*/
 static int mtcp_master = -1;
 /*----------------------------------------------------------------------------*/
@@ -78,31 +78,38 @@ HandleSignal(int signal)
 
 	if (signal == SIGINT) {
 		int core;
-		struct timeval cur_ts;
+		struct timespec cur_ts;
 
 		core = sched_getcpu();
-		gettimeofday(&cur_ts, NULL);
+		clock_gettime(CLOCK_REALTIME, &cur_ts);
 
-		if (sigint_cnt[core] > 0 && cur_ts.tv_sec > sigint_ts[core].tv_sec) {
-			for (i = 0; i < num_cpus; i++) {
-				if (running[i]) {
+		if (CONFIG.multi_process) {
+			for (i = 0; i < num_cpus; i++)
+				if (running[i] == TRUE)
 					g_pctx[i]->exit = TRUE;
-				}
-			}
 		} else {
-			for (i = 0; i < num_cpus; i++) {
-				g_pctx[i]->interrupt = TRUE;
-			}
-			if (!app_signal_handler) {
+			if (sigint_cnt[core] > 0 && cur_ts.tv_sec > sigint_ts[core].tv_sec) {
 				for (i = 0; i < num_cpus; i++) {
 					if (running[i]) {
 						g_pctx[i]->exit = TRUE;
 					}
 				}
+			} else {
+				for (i = 0; i < num_cpus; i++) {
+					if (running[i])
+						g_pctx[i]->interrupt = TRUE;
+				}
+				if (!app_signal_handler) {
+					for (i = 0; i < num_cpus; i++) {
+						if (running[i]) {
+							g_pctx[i]->exit = TRUE;
+						}
+					}
+				}
 			}
+			sigint_cnt[core]++;
+			clock_gettime(CLOCK_REALTIME, &sigint_ts[core]);
 		}
-		sigint_cnt[core]++;
-		gettimeofday(&sigint_ts[core], NULL);
 	}
 
 	if (signal != SIGUSR1) {
@@ -176,10 +183,14 @@ PrintThreadNetworkStats(mtcp_manager_t mtcp, struct net_stat *ns)
 					"TX: %7ld(pps), %5.2lf(Gbps)\n", 
 					mtcp->ctx->cpu, CONFIG.eths[i].dev_name, mtcp->flow_cnt, 
 					ns->rx_packets[i], ns->rx_errors[i], GBPS(ns->rx_bytes[i]), 
-					ns->tx_packets[i], GBPS(ns->tx_bytes[i]));
+				ns->tx_packets[i], GBPS(ns->tx_bytes[i]));
 		}
 #endif
 	}
+#ifdef ENABLELRO
+	ns->rx_gdptbytes = mtcp->nstat.rx_gdptbytes - mtcp->p_nstat.rx_gdptbytes;
+	ns->tx_gdptbytes = mtcp->nstat.tx_gdptbytes - mtcp->p_nstat.tx_gdptbytes;
+#endif
 	mtcp->p_nstat = mtcp->nstat;
 
 }
@@ -266,6 +277,10 @@ PrintNetworkStats(mtcp_manager_t mtcp, uint32_t cur_ts)
 				g_nstat.tx_drops[j] += ns.tx_drops[j];
 				g_nstat.tx_bytes[j] += ns.tx_bytes[j];
 			}
+#ifdef ENABLELRO
+			g_nstat.rx_gdptbytes += ns.rx_gdptbytes;
+			g_nstat.tx_gdptbytes += ns.tx_gdptbytes;
+#endif
 #endif
 		}
 	}
@@ -280,6 +295,10 @@ PrintNetworkStats(mtcp_manager_t mtcp, uint32_t cur_ts)
 					GBPS(g_nstat.tx_bytes[i]));
 		}
 	}
+#ifdef ENABLELRO
+	fprintf(stderr, "[ ALL ] Goodput RX: %5.2lf(Gbps), TX: %5.2lf(Gbps)\n",
+			GBPS(g_nstat.rx_gdptbytes), GBPS(g_nstat.tx_gdptbytes));
+#endif
 #endif
 
 #if ROUND_STAT
@@ -674,7 +693,7 @@ DestroyRemainingFlows(mtcp_manager_t mtcp)
 #endif
 	for (i = 0; i < NUM_BINS; i++) {
 		TAILQ_FOREACH(walk, &ht->ht_table[i], rcvvar->he_link) {
-#if 0
+#ifdef DUMP_STREAM
 			thread_printf(mtcp, mtcp->log_fp, 
 					"CPU %d: Destroying stream %d\n", mtcp->ctx->cpu, walk->id);
 			DumpStream(mtcp, walk);
@@ -691,6 +710,9 @@ DestroyRemainingFlows(mtcp_manager_t mtcp)
 static void 
 InterruptApplication(mtcp_manager_t mtcp)
 {
+	int i;
+	struct tcp_listener *listener = NULL;
+
 	/* interrupt if the mtcp_epoll_wait() is waiting */
 	if (mtcp->ep) {
 		pthread_mutex_lock(&mtcp->ep->epoll_lock);
@@ -699,14 +721,17 @@ InterruptApplication(mtcp_manager_t mtcp)
 		}
 		pthread_mutex_unlock(&mtcp->ep->epoll_lock);
 	}
+
 	/* interrupt if the accept() is waiting */
-	if (mtcp->listener) {
-		if (mtcp->listener->socket) {
-			pthread_mutex_lock(&mtcp->listener->accept_lock);
-			if (!(mtcp->listener->socket->opts & MTCP_NONBLOCK)) {
-				pthread_cond_signal(&mtcp->listener->accept_cond);
+	/* this may be a looong loop but this is called only on exit */
+	for (i = 0; i < MAX_PORT; i++) {
+		listener = ListenerHTSearch(mtcp->listeners, &i);
+		if (listener != NULL) {
+			pthread_mutex_lock(&listener->accept_lock);
+			if (!(listener->socket->opts & MTCP_NONBLOCK)) {
+				pthread_cond_signal(&listener->accept_cond);
 			}
-			pthread_mutex_unlock(&mtcp->listener->accept_lock);
+			pthread_mutex_unlock(&listener->accept_lock);			
 		}
 	}
 }
@@ -744,7 +769,10 @@ RunMainLoop(struct mtcp_thread_context *ctx)
 				uint16_t len;
 				uint8_t *pktbuf;
 				pktbuf = mtcp->iom->get_rptr(mtcp->ctx, rx_inf, i, &len);
-				ProcessPacket(mtcp, rx_inf, ts, pktbuf, len);
+				if (pktbuf != NULL)
+					ProcessPacket(mtcp, rx_inf, ts, pktbuf, len);
+				else
+					mtcp->nstat.rx_errors[rx_inf]++;
 			}
 		}
 		STAT_COUNT(mtcp->runstat.rounds_rx);
@@ -799,7 +827,9 @@ RunMainLoop(struct mtcp_thread_context *ctx)
 			ts_prev = ts;
 			if (ctx->cpu == mtcp_master) {
 				ARPTimer(mtcp, ts);
+#ifdef NETSTAT
 				PrintNetworkStats(mtcp, ts);
+#endif
 			}
 		}
 
@@ -866,9 +896,15 @@ InitializeMTCPManager(struct mtcp_thread_context* ctx)
 	}
 	g_mtcp[ctx->cpu] = mtcp;
 
-	mtcp->tcp_flow_table = CreateHashtable(HashFlow, EqualFlow);
+	mtcp->tcp_flow_table = CreateHashtable(HashFlow, EqualFlow, NUM_BINS_FLOWS);
 	if (!mtcp->tcp_flow_table) {
 		CTRACE_ERROR("Falied to allocate tcp flow table.\n");
+		return NULL;
+	}
+
+	mtcp->listeners = CreateHashtable(HashListener, EqualListener, NUM_BINS_LISTENERS);
+	if (!mtcp->listeners) {
+		CTRACE_ERROR("Failed to allocate listener table.\n");
 		return NULL;
 	}
 
@@ -902,11 +938,17 @@ InitializeMTCPManager(struct mtcp_thread_context* ctx)
 		CTRACE_ERROR("Failed to create send ring buffer.\n");
 		return NULL;
 	}
+#ifdef ENABLELRO
+	mtcp->rbm_rcv = RBManagerCreate(mtcp, CONFIG.rcvbuf_size, CONFIG.max_num_buffers);
+#else
 	mtcp->rbm_rcv = RBManagerCreate(CONFIG.rcvbuf_size, CONFIG.max_num_buffers);
+#endif
 	if (!mtcp->rbm_rcv) {
 		CTRACE_ERROR("Failed to create recv ring buffer.\n");
 		return NULL;
 	}
+
+	InitializeTCPStreamManager();
 
 	mtcp->smap = (socket_map_t)calloc(CONFIG.max_concurrency, sizeof(struct socket_map));
 	if (!mtcp->smap) {
@@ -1077,6 +1119,10 @@ MTCPRunThread(void *arg)
 
 	/* start the main loop */
 	RunMainLoop(ctx);
+
+	/* destroy hash tables */
+	DestroyHashtable(g_mtcp[cpu]->tcp_flow_table);
+	DestroyHashtable(g_mtcp[cpu]->listeners);
 	
 	TRACE_DBG("MTCP thread %d finished.\n", ctx->cpu);
 	
@@ -1103,6 +1149,13 @@ mtcp_create_context(int cpu)
 					cpu, CONFIG.num_cores);
 		return NULL;
 	}
+
+        /* check if mtcp_create_context() was already initialized */
+        if (g_logctx[cpu] != NULL) {
+                TRACE_ERROR("%s was already initialized before!\n",
+                            __FUNCTION__);
+                return NULL;
+        }
 
 	ret = sem_init(&g_init_sem[cpu], 0, 0);
 	if (ret) {
@@ -1186,7 +1239,9 @@ mtcp_destroy_context(mctx_t mctx)
 			if (mtcp->smap[i].socktype == MTCP_SOCK_STREAM) {
 				TRACE_DBG("Closing remaining socket %d (%s)\n", 
 						i, TCPStateToString(mtcp->smap[i].stream));
+#ifdef DUMP_STREAM
 				DumpStream(mtcp, mtcp->smap[i].stream);
+#endif
 				mtcp_close(mctx, i);
 			}
 		}
@@ -1352,13 +1407,14 @@ mtcp_setconf(const struct mtcp_conf *conf)
 }
 /*----------------------------------------------------------------------------*/
 int 
-mtcp_init(char *config_file)
+mtcp_init(const char *config_file)
 {
 	int i;
 	int ret;
 
 	if (geteuid()) {
-		TRACE_CONFIG("[CAUTION] Run as root if mlock is necessary.\n");
+		TRACE_CONFIG("[CAUTION] Run the app as root!\n");
+		exit(EXIT_FAILURE);
 	}
 
 	/* getting cpu and NIC */
@@ -1388,11 +1444,13 @@ mtcp_init(char *config_file)
 	}
 	PrintConfiguration();
 
-	/* TODO: this should be fixed */
-	ap = CreateAddressPool(CONFIG.eths[0].ip_addr, 1);
-	if (!ap) {
-		TRACE_CONFIG("Error occured while creating address pool.\n");
-		return -1;
+	for (i = 0; i < CONFIG.eths_num; i++) {
+		ap[i] = CreateAddressPool(CONFIG.eths[i].ip_addr, 1);
+		if (!ap[i]) {
+			TRACE_CONFIG("Error occured while create address pool[%d]\n",
+				     i);
+			return -1;
+		}
 	}
 	
 	PrintInterfaceInfo();
@@ -1435,7 +1493,8 @@ mtcp_destroy()
 		}
 	}
 
-	DestroyAddressPool(ap);
+	for (i = 0; i < CONFIG.eths_num; i++)
+		DestroyAddressPool(ap[i]);
 
 	TRACE_INFO("All MTCP threads are joined.\n");
 }

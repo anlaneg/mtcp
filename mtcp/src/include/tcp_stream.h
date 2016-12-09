@@ -193,29 +193,29 @@ typedef struct tcp_stream
 
 } tcp_stream;
 
-inline char *
+extern inline char *
 TCPStateToString(const tcp_stream *cur_stream);
 
 unsigned int
-HashFlow(const tcp_stream *flow);
+HashFlow(const void *flow);
 
 int
-EqualFlow(const tcp_stream *flow1, const tcp_stream *flow2);
+EqualFlow(const void *flow1, const void *flow2);
 
-inline int 
+extern inline int 
 AddEpollEvent(struct mtcp_epoll *ep, 
 		int queue_type, socket_map_t socket, uint32_t event);
 
-inline void 
+extern inline void 
 RaiseReadEvent(mtcp_manager_t mtcp, tcp_stream *stream);
 
-inline void 
+extern inline void 
 RaiseWriteEvent(mtcp_manager_t mtcp, tcp_stream *stream);
 
-inline void 
+extern inline void 
 RaiseCloseEvent(mtcp_manager_t mtcp, tcp_stream *stream);
 
-inline void 
+extern inline void 
 RaiseErrorEvent(mtcp_manager_t mtcp, tcp_stream *stream);
 
 tcp_stream *
@@ -227,5 +227,8 @@ DestroyTCPStream(mtcp_manager_t mtcp, tcp_stream *stream);
 
 void 
 DumpStream(mtcp_manager_t mtcp, tcp_stream *stream);
+
+extern inline void
+InitializeTCPStreamManager();
 
 #endif /* __TCP_STREAM_H_ */
